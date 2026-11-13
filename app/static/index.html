@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>记录仪本地时间校时</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>空气质量记录仪 · 本地时间 → UTC 校时</h1>
+    <p class="sub">旧记录仪未带 UTC 偏移的本地时间，在此还原为 UTC，避免暴露分析错配时段。</p>
+  </header>
+
+  <section id="upload-card" class="card">
+    <h2>1. 上传 CSV（≤500 行：采集序号, 本地时间, PM2.5）</h2>
+    <div class="row">
+      <input type="file" id="file" accept=".csv,text/csv">
+      <input type="text" id="tz" list="tz-list" placeholder="IANA 时区，如 America/New_York" size="34">
+      <datalist id="tz-list"></datalist>
+      <button id="upload-btn">上传并校时</button>
+    </div>
+    <div class="row">
+      <span class="hint">没有文件？试试样例：</span>
+      <button class="sample" data-sample="fallback.csv" data-tz="America/New_York">回拨样例（重叠小时）</button>
+      <button class="sample" data-sample="spring_forward.csv" data-tz="America/New_York">跳时样例（不存在时刻）</button>
+    </div>
+    <p class="hint">表头支持：采集序号/seq、本地时间/local_time、PM2.5/pm25；本地时间格式 <code>YYYY-MM-DD HH:MM:SS</code>。序号代表真实采集顺序，原行顺序保留。</p>
+  </section>
+
+  <section id="task-card" class="card hidden">
+    <h2>2. 消歧与核对</h2>
+    <div class="row meta">
+      <span>任务 <code id="task-id"></code> <button id="share-btn" title="复制任务链接">复制链接</button></span>
+      <span>所见修订 <code id="revision"></code></span>
+      <span>时区 <code id="task-tz"></code>
+        <button id="tz-change-btn">更换时区（清空旧选择）</button>
+      </span>
+    </div>
+    <div id="banner"></div>
+    <table id="rows-table">
+      <thead>
+        <tr>
+          <th>#</th><th>采集序号</th><th>本地时间</th><th>PM2.5</th><th>状态</th><th>UTC 候选 / 结果</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <div class="row">
+      <button id="export-btn" disabled>3. 下载含原值和 UTC 的 CSV</button>
+      <span id="export-hint" class="hint"></span>
+    </div>
+  </section>
+
+  <div id="toast" class="hidden"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
