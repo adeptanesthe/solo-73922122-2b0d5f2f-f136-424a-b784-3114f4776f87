@@ -2,19 +2,18 @@
 "use strict";
 
 let task = null; // 当前任务状态（含所见修订号）
+let demoInfo = null; // 演示环境信息（peer 地址等），非演示环境为 null
 
 const $ = (id) => document.getElementById(id);
 
-function toast(msg, ms = 4200) {
-  const el = $("toast");
-  el.textContent = msg;
-  el.classList.remove("hidden");
-  clearTimeout(el._timer);
-  el._timer = setTimeout(() => el.classList.add("hidden"), ms);
+// 演示时可以把请求发往另一个共库进程；日常环境全部走本进程。
+function baseUrl() {
+  const sel = $("peer-switch");
+  return sel && sel.value === "peer" ? demoInfo.peer : "";
 }
 
-async function api(path, options = {}) {
-  const resp = await fetch(path, options);
+async function callApi(url, options = {}) {
+  const resp = await fetch(url, options);
   const ct = resp.headers.get("content-type") || "";
   const data = ct.includes("json") ? await resp.json() : await resp.text();
   if (!resp.ok) {
@@ -23,6 +22,18 @@ async function api(path, options = {}) {
     throw err;
   }
   return data;
+}
+
+async function api(path, options = {}) {
+  return callApi(baseUrl() + path, options);
+}
+
+function toast(msg, ms = 4200) {
+  const el = $("toast");
+  el.textContent = msg;
+  el.classList.remove("hidden");
+  clearTimeout(el._timer);
+  el._timer = setTimeout(() => el.classList.add("hidden"), ms);
 }
 
 function fmtUtc(iso) {
@@ -187,7 +198,7 @@ $("tz-change-btn").addEventListener("click", () => {
 $("export-btn").addEventListener("click", async () => {
   try {
     const resp = await fetch(
-      `/api/tasks/${task.id}/export?revision=${task.revision}`
+      `${baseUrl()}/api/tasks/${task.id}/export?revision=${task.revision}`
     );
     if (!resp.ok) {
       const data = await resp.json();
@@ -233,4 +244,208 @@ $("share-btn").addEventListener("click", async () => {
       toast("链接中的任务不存在或已过期");
     }
   }
+  initDemo();
 })();
+
+// ---------- 演示面板（仅 APP_DEMO_HOOKS=1 时出现） ----------
+
+const demoLog = (msg) => {
+  const el = $("demo-log");
+  const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  el.textContent = (el.textContent ? el.textContent + "\n" : "") + line;
+  el.scrollTop = el.scrollHeight;
+};
+
+function showDemo(status) {
+  const el = $("demo-state");
+  el.textContent = status || "空闲";
+}
+
+async function initDemo() {
+  try {
+    demoInfo = await callApi("/api/demo/info");
+  } catch {
+    return; // 非演示环境
+  }
+  $("demo-card").classList.remove("hidden");
+  $("peer-url").textContent = demoInfo.peer || "（未配置 APP_PEER_URL）";
+  const canPeer = Boolean(demoInfo.peer);
+  if (canPeer) {
+    $("peer-switch-wrap").classList.remove("hidden");
+  }
+}
+
+async function setHook(mode, base = "") {
+  const info = await callApi(base + "/api/demo/hooks", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode }),
+  });
+  showDemo(mode ? `已设置 ${mode}（${base || "本进程"}）` : "空闲");
+  return info;
+}
+
+// 等被演示钩子退出的进程被重启（compose restart 策略）。
+async function waitPeer(base, seconds = 25) {
+  const deadline = Date.now() + seconds * 1000;
+  while (Date.now() < deadline) {
+    try {
+      await callApi(base + "/api/timezones");
+      return true;
+    } catch {
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  }
+  return false;
+}
+
+function demoUpload() {
+  const fd = new FormData();
+  const blob = new Blob([SAMPLE_CSV], { type: "text/csv" });
+  fd.append("file", new File([blob], "demo.csv", { type: "text/csv" }));
+  fd.append("timezone", "America/New_York");
+  return callApi("/api/tasks", { method: "POST", body: fd });
+}
+
+const SAMPLE_CSV =
+  "采集序号,本地时间,PM2.5\n" +
+  "1,2024-11-03 00:59:00,12.4\n" +
+  "2,2024-11-03 01:00:00,13.1\n" +
+  "4,2024-11-03 01:59:59,14.0\n" +
+  "3,2024-11-03 01:30:00,13.7\n" +
+  "5,2024-11-03 02:00:00,15.2\n" +
+  "6,2024-11-03 02:30:00,16.8\n";
+
+const demoRow = (st, seq) => st.rows.find((r) => r.seq === seq);
+const demoPins = (st) =>
+  st.rows.filter((r) => r.pinned).map((r) => `${r.seq}:${r.pinned}`).join(", ") || "无";
+
+async function demoRace(peer) {
+  demoLog("① 并发选择：A 与 B 同时基于同一修订提交不同选择");
+  const st = await demoUpload();
+  const tid = st.id;
+  await setHook("race");
+  await setHook("race", peer); // 两个进程都在读完快照后等一拍，竞态可控
+  demoLog(`任务 ${tid}，初始修订 #${st.revision}，行 2/3 均为回拨歧义`);
+  const body = (rid, utc) => ({
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ row_id: rid, utc, revision: st.revision }),
+  });
+  const [a, b] = await Promise.allSettled([
+    callApi(`/api/tasks/${tid}/selections`, body(demoRow(st, 2).id, "2024-11-03T05:00:00+00:00")),
+    callApi(`${peer}/api/tasks/${tid}/selections`, body(demoRow(st, 3).id, "2024-11-03T06:30:00+00:00")),
+  ]);
+  await setHook("");
+  await setHook("", peer).catch(() => {});
+  const describe = (r) =>
+    r.status === "fulfilled"
+      ? `200 成功，返回修订 #${r.value.revision}`
+      : `${r.reason.status} ${r.reason.message}`;
+  demoLog(`进程 A: ${describe(a)}`);
+  demoLog(`进程 B: ${describe(b)}`);
+  const latest = await callApi(`/api/tasks/${tid}`);
+  demoLog(`库内最终：修订 #${latest.revision}，人工选择 ${demoPins(latest)}`);
+  toast("并发选择演示完成：同一修订只有一份成功");
+}
+
+async function demoCrash(peer, when) {
+  demoLog(when === "before-commit"
+    ? "② 保存中退出：B 在 COMMIT 前退出，旧状态必须完整保留"
+    : "③ 保存中退出：B 在 COMMIT 后退出，新版必须已持久化");
+  const st = await demoUpload();
+  const tid = st.id;
+  const rev = st.revision;
+  await setHook(when, peer);
+  demoLog(`任务 ${tid}，修订 #${rev}，向进程 B 提交 seq2=05:00Z …`);
+  let cut = false;
+  try {
+    await callApi(`${peer}/api/tasks/${tid}/selections`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        row_id: demoRow(st, 2).id, utc: "2024-11-03T05:00:00+00:00", revision: rev,
+      }),
+    });
+  } catch (e) {
+    cut = true;
+    demoLog(`进程 B 连接中断（${e.message || "无响应"}），属预期`);
+  }
+  if (!cut) demoLog("进程 B 连接意外返回，请检查是否启用了演示钩子");
+  demoLog("等待进程 B 被 compose 重启 …");
+  if (!(await waitPeer(peer))) demoLog("进程 B 未在预期时间内恢复");
+  await setHook("", peer).catch(() => {});
+  const after = await callApi(`/api/tasks/${tid}`);
+  demoLog(`重启后读库：修订 #${after.revision}，人工选择 ${demoPins(after)}`);
+  let expStatus = 0;
+  try {
+    expStatus = (await fetch(
+      `${peer}/api/tasks/${tid}/export?revision=${rev}`)).status;
+  } catch {
+    expStatus = 0;
+  }
+  demoLog(`用旧修订 #${rev} 导出：HTTP ${expStatus}`);
+  if (when === "before-commit") {
+    const good = after.revision === rev && !demoRow(after, 2).pinned;
+    toast(good ? "提交前退出：旧状态保留，旧修订不能导出新 UTC"
+               : "状态不符合预期，请查看日志");
+  } else {
+    const good = after.revision === rev + 1 && demoRow(after, 2).pinned;
+    toast(good ? "提交后退出：重启后仍是新版" : "状态不符合预期，请查看日志");
+  }
+}
+
+async function demoReadRace(peer) {
+  demoLog("④ 查询中换时区：A 读任务后暂停，B 换时区；A 的响应不得拼接");
+  const st = await demoUpload();
+  const tid = st.id;
+  let cur = await callApi(`/api/tasks/${tid}/selections`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      row_id: demoRow(st, 2).id, utc: "2024-11-03T05:00:00+00:00", revision: st.revision,
+    }),
+  });
+  const rev = cur.revision;
+  await setHook("read");
+  const pending = callApi(`/api/tasks/${tid}`);
+  await new Promise((r) => setTimeout(r, 250));
+  const tz = await callApi(`${peer}/api/tasks/${tid}/timezone`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ timezone: "Asia/Shanghai", revision: rev }),
+  });
+  const got = await pending;
+  await setHook("");
+  demoLog(`并发查询返回：修订 #${got.revision}，时区 ${got.timezone}，人工选择 ${demoPins(got)}`);
+  demoLog(`换时区返回：修订 #${tz.revision}，时区 ${tz.timezone}，人工选择 ${demoPins(tz)}`);
+  const latest = await callApi(`/api/tasks/${tid}`);
+  demoLog(`库内最新：修订 #${latest.revision}，时区 ${latest.timezone}`);
+  const good = got.revision === rev && got.timezone === "America/New_York";
+  toast(good ? "查询响应来自同一份已提交快照，没有拼接" : "出现拼接，请查看日志");
+}
+
+document.querySelectorAll(".demo-run").forEach((btn) => {
+  btn.addEventListener("click", async () => {
+    if (!demoInfo || !demoInfo.peer) {
+      return toast("演示环境未配置另一共库进程地址（APP_PEER_URL）");
+    }
+    btn.disabled = true;
+    $("demo-log").textContent = "";
+    try {
+      const kind = btn.dataset.demo;
+      if (kind === "race") await demoRace(demoInfo.peer);
+      else if (kind === "read-race") await demoReadRace(demoInfo.peer);
+      else await demoCrash(
+        demoInfo.peer,
+        kind === "crash-before" ? "before-commit" : "after-commit"
+      );
+    } catch (e) {
+      demoLog("演示中断：" + e.message);
+      toast("演示中断：" + e.message);
+    } finally {
+      btn.disabled = false;
+      showDemo("");
+    }
+  });
+});

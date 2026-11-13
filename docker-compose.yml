@@ -1,11 +1,46 @@
 services:
-  web:
+  # 两个 Web 进程共用一个 SQLite 库文件（同一个 app-data 卷）。
+  # 修订号并发控制依赖 SQLite 的跨进程写事务，而不是任何进程内锁。
+  web-a:
     build: .
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      APP_DB: /data/app.db
+      APP_DEMO_HOOKS: "1"
+      APP_SELF_URL: http://localhost:8000
+      APP_PEER_URL: http://localhost:8001
     ports:
       - "8000:8000"
     volumes:
       - app-data:/data
     restart: unless-stopped
+
+  web-b:
+    build: .
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001"]
+    environment:
+      APP_DB: /data/app.db
+      APP_DEMO_HOOKS: "1"
+      APP_SELF_URL: http://localhost:8001
+      APP_PEER_URL: http://localhost:8000
+    ports:
+      - "8001:8001"
+    volumes:
+      - app-data:/data
+    restart: unless-stopped
+
+  # 可控演示：并发选择、保存中退出、查询中换时区。按需运行：
+  #   docker compose run --rm demo
+  demo:
+    build: .
+    profiles: ["demo"]
+    environment:
+      APP_DEMO_HOOKS: "1"
+    depends_on:
+      - web-a
+      - web-b
+    command: ["python", "-m", "demo.run", "--base-a", "http://web-a:8000",
+              "--base-b", "http://web-b:8001", "--all"]
 
 volumes:
   app-data:

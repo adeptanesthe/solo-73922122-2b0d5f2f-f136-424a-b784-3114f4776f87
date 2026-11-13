@@ -1,9 +1,21 @@
-"""记录仪本地时间 -> UTC 校时服务（FastAPI + SQLite + zoneinfo）。"""
+"""记录仪本地时间 -> UTC 校时服务（FastAPI + SQLite + zoneinfo）。
+
+多进程共享同一 SQLite 库时的关键约束：
+
+- 所有读响应（查询/修改/导出）都基于 ``read_state`` 返回的同一份快照，
+  revision / timezone / 人工选择 / 候选不会拼接两个已提交状态。
+- 所有写操作先在不持写锁的情况下读快照、算候选与可行性，再在
+  ``BEGIN IMMEDIATE`` 事务里核对所见状态；不一致返回 409，不覆盖后来修改。
+  重算全程不持 SQLite 写锁。
+- 选择、清空选择、换时区三种修改各自原子生效（与 revision 递增同事务），
+  失败或矛盾时整事务回滚，保留原状态。
+"""
 from __future__ import annotations
 
 import csv
 import io
 import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, available_timezones
@@ -13,7 +25,7 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .db import Database
+from .db import Conflict, Database, TaskGone
 from .solver import Row, filter_viable, parse_local_time
 
 APP_DIR = Path(__file__).resolve().parent
@@ -27,6 +39,67 @@ PM_HEADERS = {"pm2.5", "pm25", "PM2.5", "PM2.5值"}
 
 app = FastAPI(title="记录仪本地时间校时服务")
 db = Database(os.environ.get("APP_DB", str(ROOT_DIR / "data" / "app.db")))
+
+# 演示环境里浏览器需要直接请求另一个共库进程（不同端口），因此仅在
+# APP_DEMO_HOOKS=1 时开放 CORS；正常部署不启用。
+if os.environ.get("APP_DEMO_HOOKS", "").strip().lower() in {"1", "true", "yes"}:
+    from fastapi.middleware.cors import CORSMiddleware
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+
+# ---------- 演示钩子（仅演示容器启用，日常运行完全不触发） ----------
+
+HOOK_LOCK = threading.Lock()
+HOOKS: dict[str, str] = {}
+
+
+def demo_enabled() -> bool:
+    return os.environ.get("APP_DEMO_HOOKS", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _crash_before_commit() -> None:
+    """在写操作已落库、COMMIT 之前退出进程：SQLite 回滚整个事务。"""
+    if demo_enabled() and HOOKS.get("crash") == "before-commit":
+        os._exit(70)
+
+
+def _crash_after_commit() -> None:
+    """在 COMMIT 返回之后、响应写出之前退出进程：新版已持久化。"""
+    if demo_enabled() and HOOKS.get("crash") == "after-commit":
+        os._exit(71)
+
+
+def _pause_after_task_read(hold_seconds: float):
+    """返回读快照钩子：读完任务后暂停，期间别处换时区也不会污染本响应。"""
+
+    def hook() -> None:
+        if not demo_enabled():
+            return
+        with HOOK_LOCK:
+            mode = HOOKS.get("pause", "")
+        if mode == "read":
+            threading.Event().wait(hold_seconds)
+
+    return hook
+
+
+def _race_pause(hold_seconds: float) -> None:
+    """修改请求读完快照后、提交前暂停，让两个请求都基于同一修订。
+
+    暂停期间不持有写锁；随后各自提交，只有一份能通过提交时的状态核对。
+    """
+    if not demo_enabled():
+        return
+    with HOOK_LOCK:
+        mode = HOOKS.get("pause", "")
+    if mode == "race":
+        threading.Event().wait(hold_seconds)
 
 
 # ---------- 状态构建 ----------
@@ -47,8 +120,7 @@ def _candidate_payload(utc: datetime, tz: ZoneInfo) -> dict:
     }
 
 
-def build_state(task: dict, rows_db: list[dict]) -> dict:
-    tz = ZoneInfo(task["timezone"])
+def _row_objects(rows_db: list[dict], tz: ZoneInfo) -> list[Row]:
     rows: list[Row] = []
     for r in rows_db:
         row = Row(
@@ -63,6 +135,13 @@ def build_state(task: dict, rows_db: list[dict]) -> dict:
         )
         row.compute_candidates(tz)
         rows.append(row)
+    return rows
+
+
+def build_state(task: dict, rows_db: list[dict]) -> dict:
+    """由一份快照构建完整状态；耗时重算全部在事务之外完成。"""
+    tz = ZoneInfo(task["timezone"])
+    rows = _row_objects(rows_db, tz)
 
     by_seq = sorted(rows, key=lambda r: r.seq)
     viable_lists, solvable = filter_viable(by_seq)
@@ -117,19 +196,42 @@ def build_state(task: dict, rows_db: list[dict]) -> dict:
     }
 
 
-def load_state(task_id: str) -> dict:
-    task = db.get_task(task_id)
-    if not task:
+def snapshot(task_id: str, pause_before_rows=None) -> tuple[dict, list[dict]]:
+    """读取同一已提交状态的 (task, rows)；任务不存在抛 404。"""
+    task, rows = db.read_state(task_id, pause_before_rows)
+    if task is None:
         raise HTTPException(404, "任务不存在")
-    return build_state(task, db.get_rows(task_id))
+    return task, rows
+
+
+def state_of(task_id: str, pause_before_rows=None) -> dict:
+    task, rows = snapshot(task_id, pause_before_rows)
+    return build_state(task, rows)
+
+
+def _conflict(observed: int, current: int) -> HTTPException:
+    return HTTPException(
+        409,
+        f"修订过期：所见修订为 {observed}，当前修订为 {current}，未应用任何修改，请刷新后重试",
+    )
 
 
 def check_revision(task: dict, revision: int) -> None:
+    """快照上的快速检查；真正的门禁在提交事务内再次核对。"""
     if revision != task["revision"]:
-        raise HTTPException(
+        raise _conflict(revision, task["revision"])
+
+
+def _commit_error(exc: Exception, revision: int) -> HTTPException:
+    if isinstance(exc, Conflict):
+        return HTTPException(
             409,
-            f"修订过期：所见修订为 {revision}，当前修订为 {task['revision']}，请刷新后重试",
+            f"修订过期：所见修订为 {revision}，提交时任务已被其他进程修改，"
+            "未应用任何修改，请刷新后重试",
         )
+    if isinstance(exc, TaskGone):
+        return HTTPException(404, "任务不存在")
+    return HTTPException(503, "写入失败，本次修改未生效，任务保持原状态，请稍后重试")
 
 
 # ---------- CSV 解析 ----------
@@ -242,109 +344,98 @@ async def create_task(file: UploadFile = File(...), timezone: str = Form(...)) -
     except UnicodeDecodeError:
         raise HTTPException(400, "文件不是有效的 UTF-8 文本")
     rows = parse_csv(text)
-    with db.lock:
-        task = db.create_task(tz, rows)
-    return load_state(task["id"])
+    task, rows_db = db.create_task(tz, rows)  # 建任务 + 建行在同一事务
+    return build_state(task, rows_db)
 
 
 @app.get("/api/tasks/{task_id}")
 def get_task(task_id: str) -> dict:
-    return load_state(task_id)
+    return state_of(task_id, pause_before_rows=_pause_after_task_read(0.6))
 
 
 @app.post("/api/tasks/{task_id}/timezone")
 def change_timezone(task_id: str, body: TimezoneIn) -> dict:
     tz = parse_timezone(body.timezone)
-    with db.lock:
-        task = db.get_task(task_id)
-        if not task:
-            raise HTTPException(404, "任务不存在")
-        check_revision(task, body.revision)
-        db.set_timezone(task_id, tz)  # 换时区清空旧选择并递增修订
-    return load_state(task_id)
+    task, rows_db = snapshot(task_id)
+    check_revision(task, body.revision)
+    _race_pause(0.6)
+    try:
+        new_task, new_rows = db.change_timezone(
+            task_id, task, rows_db, tz, before_commit=_crash_before_commit
+        )
+    except Exception as exc:
+        raise _commit_error(exc, body.revision)
+    _crash_after_commit()  # 演示：COMMIT 之后、响应之前退出
+    return build_state(new_task, new_rows)  # 只反映本次提交的状态
 
 
 @app.post("/api/tasks/{task_id}/selections")
 def select_candidate(task_id: str, body: SelectionIn) -> dict:
-    with db.lock:
-        task = db.get_task(task_id)
-        if not task:
-            raise HTTPException(404, "任务不存在")
-        check_revision(task, body.revision)
-        row_db = db.get_row(task_id, body.row_id)
-        if not row_db:
-            raise HTTPException(404, "行不存在")
-        try:
-            chosen = datetime.fromisoformat(body.utc)
-        except ValueError:
-            raise HTTPException(422, "UTC 候选格式非法")
+    task, rows_db = snapshot(task_id)
+    check_revision(task, body.revision)
+    _race_pause(0.6)
 
-        tz = ZoneInfo(task["timezone"])
-        row = Row(
-            id=row_db["id"],
-            row_index=row_db["row_index"],
-            seq=row_db["seq"],
-            local_raw=row_db["local_time"],
-            pm25_raw=row_db["pm25"],
+    try:
+        chosen = datetime.fromisoformat(body.utc)
+    except ValueError:
+        raise HTTPException(422, "UTC 候选格式非法")
+    if chosen.tzinfo is None:
+        raise HTTPException(422, "UTC 候选必须带时区偏移")
+
+    # 在快照上（不持写锁）校验候选并试算矛盾。
+    tz = ZoneInfo(task["timezone"])
+    rows = _row_objects(rows_db, tz)
+    target = next((r for r in rows if r.id == body.row_id), None)
+    if target is None:
+        raise HTTPException(404, "行不存在")
+    if chosen not in target.candidates:
+        raise HTTPException(409, "该候选不属于此行的合法 UTC 候选，已保留原选择")
+
+    target.pinned_utc = chosen
+    _, solvable = filter_viable(sorted(rows, key=lambda r: r.seq))
+    if not solvable:
+        raise HTTPException(
+            409, "矛盾选择：与整份记录 UTC 严格递增约束冲突，已保留原选择"
         )
-        row.compute_candidates(tz)
-        if chosen not in row.candidates:
-            raise HTTPException(409, "该候选不属于此行的合法 UTC 候选，已保留原选择")
 
-        # 先记下旧选择，矛盾时回滚
-        old_pin = row_db["pinned_utc"]
-        db.set_pin(task_id, body.row_id, chosen.isoformat())
-        rows_now = db.get_rows(task_id)
-        solver_rows = []
-        for r in rows_now:
-            sr = Row(
-                id=r["id"],
-                row_index=r["row_index"],
-                seq=r["seq"],
-                local_raw=r["local_time"],
-                pm25_raw=r["pm25"],
-                pinned_utc=(
-                    datetime.fromisoformat(r["pinned_utc"]) if r["pinned_utc"] else None
-                ),
-            )
-            sr.compute_candidates(tz)
-            solver_rows.append(sr)
-        _, solvable = filter_viable(sorted(solver_rows, key=lambda r: r.seq))
-        if not solvable:
-            db.set_pin(task_id, body.row_id, old_pin)  # 保留原选择
-            raise HTTPException(
-                409, "矛盾选择：与整份记录 UTC 严格递增约束冲突，已保留原选择"
-            )
-        db.bump_revision(task_id)
-    return load_state(task_id)
+    try:
+        new_task, new_rows = db.set_selection(
+            task_id, task, rows_db, body.row_id, chosen.isoformat(),
+            before_commit=_crash_before_commit,
+        )
+    except Exception as exc:
+        raise _commit_error(exc, body.revision)
+    _crash_after_commit()  # 演示：COMMIT 之后、响应之前退出
+    return build_state(new_task, new_rows)  # 只反映本次提交的状态
 
 
 @app.post("/api/tasks/{task_id}/clear-selection")
 def clear_selection(task_id: str, body: ClearIn) -> dict:
-    with db.lock:
-        task = db.get_task(task_id)
-        if not task:
-            raise HTTPException(404, "任务不存在")
-        check_revision(task, body.revision)
-        if not db.get_row(task_id, body.row_id):
-            raise HTTPException(404, "行不存在")
-        db.set_pin(task_id, body.row_id, None)
-        db.bump_revision(task_id)
-    return load_state(task_id)
+    task, rows_db = snapshot(task_id)
+    check_revision(task, body.revision)
+    _race_pause(0.6)
+    if not any(r["id"] == body.row_id for r in rows_db):
+        raise HTTPException(404, "行不存在")
+    try:
+        new_task, new_rows = db.clear_selection(
+            task_id, task, rows_db, body.row_id, before_commit=_crash_before_commit
+        )
+    except Exception as exc:
+        raise _commit_error(exc, body.revision)
+    _crash_after_commit()  # 演示：COMMIT 之后、响应之前退出
+    return build_state(new_task, new_rows)  # 只反映本次提交的状态
 
 
 @app.get("/api/tasks/{task_id}/export")
 def export_csv(task_id: str, revision: int = Query(...)) -> Response:
-    with db.lock:
-        task = db.get_task(task_id)
-        if not task:
-            raise HTTPException(404, "任务不存在")
-        check_revision(task, revision)  # 拒绝旧修订导出
-        state = build_state(task, db.get_rows(task_id))
-        if state["status"] != "resolved":
-            raise HTTPException(
-                422, "存在无解或歧义行，全部唯一确定前禁止导出"
-            )
+    # 查询与导出共用一份快照：revision、时区、选择、候选都来自同一次提交。
+    task, rows_db = snapshot(task_id, pause_before_rows=_pause_after_task_read(0.6))
+    check_revision(task, revision)  # 拒绝旧修订导出
+    state = build_state(task, rows_db)
+    if state["status"] != "resolved":
+        raise HTTPException(
+            422, "该修订未全部核准：存在跳时错误、无解或歧义行，禁止导出"
+        )
 
     buf = io.StringIO()
     writer = csv.writer(buf, lineterminator="\r\n")
@@ -352,7 +443,7 @@ def export_csv(task_id: str, revision: int = Query(...)) -> Response:
     for r in state["rows"]:  # 保留原行顺序
         utc = datetime.fromisoformat(r["resolved_utc"]).strftime("%Y-%m-%dT%H:%M:%SZ")
         writer.writerow([r["seq"], r["local_time"], r["pm25"], utc])
-    payload = "\ufeff" + buf.getvalue()  # BOM，便于 Excel 正确识别 UTF-8
+    payload = "﻿" + buf.getvalue()  # BOM，便于 Excel 正确识别 UTF-8
     return Response(
         content=payload.encode("utf-8"),
         media_type="text/csv; charset=utf-8",
@@ -360,6 +451,42 @@ def export_csv(task_id: str, revision: int = Query(...)) -> Response:
             "Content-Disposition": f'attachment; filename="task_{task_id}_utc.csv"'
         },
     )
+
+
+# ---------- 演示控制（仅演示容器可调用） ----------
+
+class HookIn(BaseModel):
+    mode: str = ""
+
+
+@app.get("/api/demo/info")
+def demo_info() -> dict:
+    """浏览器演示面板用：返回另一个共库进程的地址（需 APP_DEMO_HOOKS=1）。"""
+    if not demo_enabled():
+        raise HTTPException(404, "未找到")
+    return {
+        "enabled": True,
+        "self": os.environ.get("APP_SELF_URL", ""),
+        "peer": os.environ.get("APP_PEER_URL", ""),
+        "hooks": dict(HOOKS),
+    }
+
+
+@app.post("/api/demo/hooks")
+def set_demo_hook(body: HookIn) -> dict:
+    if not demo_enabled():
+        raise HTTPException(404, "未找到")
+    if body.mode not in {"", "read", "race", "before-commit", "after-commit"}:
+        raise HTTPException(400, "未知演示模式")
+    with HOOK_LOCK:
+        if body.mode == "":
+            HOOKS.pop("pause", None)
+            HOOKS.pop("crash", None)
+        elif body.mode in {"read", "race"}:
+            HOOKS["pause"] = body.mode
+        else:
+            HOOKS["crash"] = body.mode
+    return {"hooks": dict(HOOKS), "enabled": True}
 
 
 app.mount("/static", StaticFiles(directory=APP_DIR / "static"), name="static")

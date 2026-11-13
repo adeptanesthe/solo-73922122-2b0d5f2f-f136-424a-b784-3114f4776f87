@@ -36,6 +36,13 @@
       <span>时区 <code id="task-tz"></code>
         <button id="tz-change-btn">更换时区（清空旧选择）</button>
       </span>
+      <span id="peer-switch-wrap" class="hidden">
+        请求发往
+        <select id="peer-switch">
+          <option value="self">本进程</option>
+          <option value="peer">另一共库进程</option>
+        </select>
+      </span>
     </div>
     <div id="banner"></div>
     <table id="rows-table">
@@ -50,6 +57,26 @@
       <button id="export-btn" disabled>3. 下载含原值和 UTC 的 CSV</button>
       <span id="export-hint" class="hint"></span>
     </div>
+  </section>
+
+  <section id="demo-card" class="card hidden">
+    <h2>并发演示（两个共库进程 · 可控）</h2>
+    <p class="hint">
+      演示面板会把同一任务同时发往两个共用 SQLite 库的 Web 进程（A 与 B），
+      用可重复的时序观察：同一修订只有一份修改成功、保存中退出、查询中换时区。
+    </p>
+    <div class="row">
+      <span>当前页面 = 进程 <code>A</code></span>
+      <span>另一共库进程 <code id="peer-url"></code></span>
+      <span>演示钩子 <code id="demo-state">空闲</code></span>
+    </div>
+    <div class="row">
+      <button class="demo-run" data-demo="race">① 并发选择（同一修订）</button>
+      <button class="demo-run" data-demo="crash-before">② 保存中退出（COMMIT 前）</button>
+      <button class="demo-run" data-demo="crash-after">③ 保存中退出（COMMIT 后）</button>
+      <button class="demo-run" data-demo="read-race">④ 查询中换时区</button>
+    </div>
+    <pre id="demo-log" class="demo-log"></pre>
   </section>
 
   <div id="toast" class="hidden"></div>
